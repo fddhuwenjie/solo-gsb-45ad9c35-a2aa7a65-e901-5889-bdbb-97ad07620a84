@@ -41,6 +41,16 @@
 末页返回 `resume_cursor` 用于续拉增量，**空轮也推进水位**；游标版本、结构、
 范围错误或跨文档使用一律 422，事件载荷只保留对应行落库时的稳定业务字段。
 
+此外提供**批量偏移换算**（`POST /documents/{id}/versions/{n}/coordinates`）：
+浏览器（JavaScript 字符串按 UTF-16 码元计偏移）与外部工具（常见按 UTF-8
+字节计偏移）提交的选区端点，可批量换算为本服务统一的 Unicode 码点偏移，
+避免 emoji 等字符让选区错位。请求声明输入单位（`codepoint` / `utf16` /
+`utf8_byte`）并提交至多 200 个半开区间，服务先按目标版本全文**一次扫描
+构建边界映射**，随后逐端点 O(1) 查表，整批复杂度 **O(n+m)**；响应逐项
+给出三种单位的对应范围与原索引。越界、`start > end`、端点落在 UTF-16
+代理对或 UTF-8 多字节字符内部时**整批返回 422** 并指出条目与端点，
+绝不取整猜测。接口只读，同一快照结果稳定。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -63,7 +73,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（183 个用例）
+pytest                                       # 运行测试（230 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -81,7 +91,9 @@ pytest                                       # 运行测试（183 个用例）
 | `start` / `end` | 原始偏移，**按 Unicode 码点计**（`end` 不含；emoji 等 BMP 外字符算 1 个码点） |
 
 > ⚠️ 前端若用 JavaScript 计算偏移，注意 JS 字符串按 UTF-16 码元计，
-> 遇到 emoji 等字符会与本服务的码点偏移不一致，需先换算。
+> 遇到 emoji 等字符会与本服务的码点偏移不一致，需先换算。可直接调用
+> [`POST /documents/{id}/versions/{n}/coordinates`](#批量偏移换算codepoint--utf16--utf8_byte)
+> 把 UTF-16（或外部工具的 UTF-8）区间批量换算为码点区间（见下文示例）。
 
 创建时服务端会严格校验 `text[start:end] == selection` 及左右上下文与基准文本一致，否则返回 422。
 
@@ -437,6 +449,51 @@ ID 列表顺序必然相同。
 
 文档不存在返回 404。接口只读，不会创建或修改任何记录。
 
+### 批量偏移换算（codepoint / utf16 / utf8_byte）
+
+`POST /documents/{id}/versions/{n}/coordinates` 只读地把目标版本全文上的一批
+半开区间在三种偏移单位之间互转，专为两类客户端准备：
+
+| 客户端 | 原生偏移单位 | 请求值 |
+|---|---|---|
+| 浏览器 JavaScript（`selectionStart`、`Range`、字符串索引） | UTF-16 码元 | `"utf16"` |
+| Python / Rust 等按 Unicode 标量值遍历的工具 | Unicode 码点 | `"codepoint"` |
+| C / Go / 字节级存储、`Content-Range` 类外部工具 | UTF-8 字节 | `"utf8_byte"` |
+
+请求体：
+
+| 字段 | 含义 |
+|---|---|
+| `input_unit` | 区间端点的输入单位：`codepoint` / `utf16` / `utf8_byte` |
+| `intervals` | 半开区间 `[start, end)` 列表，**1～200 个**；允许空区间 `[x, x)` |
+
+服务先按目标版本全文做**一次线性扫描构建边界映射**，之后每个端点 O(1)
+查表，整批复杂度 **O(n + m)**（n 为全文码点数、m 为区间数）。响应：
+
+- `lengths`：全文在三种单位下的总长度（便于客户端自检）；
+- `results[i]`：按请求顺序逐项返回，带原下标 `index`，并给出
+  `codepoint` / `utf16` / `utf8_byte` 三个 `{start, end}` 对应范围。
+
+**整批校验**——任一区间有问题则整批 422（`detail.errors` 一次性列出全部
+问题），每条错误带 `error` 机器码、`index`（条目下标）、`endpoint`
+（`start` / `end` / `interval`）、`path`（如 `intervals[3].start`）与
+中文 `message`，**绝不取整猜测**：
+
+| 情况 | 错误码 |
+|---|---|
+| 端点超出 `0..该单位总长`（含负数） | `endpoint_out_of_range` |
+| `start > end`（空区间 `[x, x)` 合法） | `start_after_end` |
+| UTF-16 端点落在代理对的两个码元之间 | `inside_surrogate_pair` |
+| UTF-8 端点落在多字节字符的字节中间 | `inside_multibyte_sequence` |
+
+> **组合字符不算字符内部**：例如 `é`（`e` + U+0301 组合尖音符）是两个
+> 独立码点，二者之间的端点是合法边界（按码点与 UTF-16 都能对齐），
+> 只有代理对内部与 UTF-8 续字节位置才是非法端点。
+
+文档或版本不存在返回 404；空批次、超过 200 个、非法单位等结构问题由
+schema 直接返回 422。接口不写入任何数据；版本内容只追加、不可变，
+同一版本下相同请求的响应序列化后**字节一致**。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -451,6 +508,7 @@ ID 列表顺序必然相同。
 | POST | `/documents/{id}/versions` | 提交新版全文，触发全部批注的续接迁移 |
 | GET | `/documents/{id}/versions` | 版本列表 |
 | GET | `/documents/{id}/versions/{n}` | 某版全文及该版全部迁移结果 |
+| POST | `/documents/{id}/versions/{n}/coordinates` | 批量偏移换算：codepoint/utf16/utf8_byte 半开区间互转（整批校验代理对/多字节内部/越界，只读） |
 | GET | `/documents/{id}/versions/{n}/coverage` | 文档批注覆盖图：全文划分为 covered/uncertain/uncovered 最大片段，含 definite/possible 批注 ID 与 exclusions（只读） |
 | GET | `/documents/{id}/compare?from_version=&to_version=` | 任意两版间每条批注的范围、状态与匹配依据 |
 | GET | `/documents/{id}/impact?from_version=&to_version=` | 批注改动影响分析：码点级编辑片段 + 起始版每条批注范围到目标版的投影与分类 |
@@ -1021,11 +1079,99 @@ curl "$B/documents/2/events?cursor=eyJ2IjoxLCJraW5kIjoicmVzdW1l...文档1的游�
 #                  "message":"游标属于文档 1，不能用于文档 2 的事件流（游标不可跨文档使用）"}}
 ```
 
+批量偏移换算示例（含 **emoji、组合字符与中文**）：
+
+```bash
+B=http://localhost:8000
+
+# 1. 新建文档，全文为：a 🎉 é（= e + U+0301 组合尖音符） 中
+#    5 个码点；宽度（码点 / UTF-16 码元 / UTF-8 字节）：
+#      a=1/1/1   🎉=1/2/4   e=1/1/1   ́=1/1/2   中=1/1/3
+#    合计：5 码点 / 6 UTF-16 码元 / 11 UTF-8 字节
+python3 - <<'PY'
+import json, urllib.request
+content = "a" + "\U0001F389" + "e" + "́" + "中"
+body = json.dumps({"title": "偏移换算示例", "content": content}).encode("utf-8")
+req = urllib.request.Request("http://localhost:8000/documents", data=body,
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req).read().decode())
+PY
+# → {"document_id": 1, ...}
+
+# 2. 浏览器按 UTF-16 码元提交选区：🎉 占码元 [1,3)，é 占 [3,5)
+#    一次批量换算为码点 / UTF-8，results 顺序与原索引一致
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+  "input_unit": "utf16",
+  "intervals": [
+    {"start": 1, "end": 3},
+    {"start": 3, "end": 5},
+    {"start": 0, "end": 6}
+  ]
+}'
+# → 200
+# {"document_id":1,"version_number":1,"input_unit":"utf16",
+#  "lengths":{"codepoint":5,"utf16":6,"utf8_byte":11},
+#  "results":[
+#    {"index":0,"codepoint":{"start":1,"end":2},
+#                 "utf16":{"start":1,"end":3},"utf8_byte":{"start":1,"end":5}},
+#    {"index":1,"codepoint":{"start":2,"end":4},
+#                 "utf16":{"start":3,"end":5},"utf8_byte":{"start":5,"end":8}},
+#    {"index":2,"codepoint":{"start":0,"end":5},
+#                 "utf16":{"start":0,"end":6},"utf8_byte":{"start":0,"end":11}}]}
+# 即：🎉 对应码点 [1,2)；é（e+组合符）对应码点 [2,4)，可直接用于创建批注。
+
+# 3. 外部工具按 UTF-8 字节提交：组合符两侧的边界合法（e=[5,6)，́=[6,8)）
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+  "input_unit": "utf8_byte",
+  "intervals": [{"start": 5, "end": 6}, {"start": 6, "end": 8},
+                {"start": 8, "end": 11}]
+}'
+# → results: e→码点[2,3)，́→码点[3,4)，中→码点[4,5)（UTF-16 [5,6)）
+
+# 4. 端点落在 UTF-16 代理对内部（🎉 的两个码元之间，偏移 2）→ 整批 422，
+#    指出条目与端点，不取整
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+  "input_unit": "utf16",
+  "intervals": [{"start": 0, "end": 1}, {"start": 2, "end": 3}]
+}'
+# → 422 {"detail":{"message":"偏移换算请求校验失败，整批未换算（不对任何端点取整）",
+#                  "input_unit":"utf16",
+#                  "lengths":{"codepoint":5,"utf16":6,"utf8_byte":11},
+#                  "errors":[{"error":"inside_surrogate_pair",
+#                    "message":"条目 1 的 start=2 落在 UTF-16 代理对内部：码位 U+1F389……",
+#                    "path":"intervals[1].start","index":1,"endpoint":"start",
+#                    "unit":"utf16","value":2}]}}
+
+# 5. 端点落在 UTF-8 多字节字符内部（「中」占字节 [8,11)，9 是续字节）→ 422
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+  "input_unit": "utf8_byte",
+  "intervals": [{"start": 9, "end": 11}]
+}'
+# → 422 errors[0]: {"error":"inside_multibyte_sequence",
+#                   "path":"intervals[0].start", ... "码位 U+4E2D……字节区间 [8, 11)"}
+
+# 6. 越界与 start>end 在同一批中一次性全部定位（允许空区间 [x,x)）
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+  "input_unit": "codepoint",
+  "intervals": [{"start": 0, "end": 99}, {"start": 4, "end": 2}]
+}'
+# → 422 errors:
+#   [{"error":"endpoint_out_of_range","path":"intervals[0].end", ...},
+#    {"error":"start_after_end",      "path":"intervals[1]", ...}]
+
+# 7. 只读且确定：不新增批注 / 迁移记录；相同请求多次调用结果字节一致。
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件接口）
+  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件与批量偏移换算接口）
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
@@ -1033,9 +1179,10 @@ app/
   review.py     # 审阅依赖图算法：环检测、传递前置、拓扑分层（纯函数）
   gate.py       # 发布门禁策略树：语法校验（深度/节点数/枚举域）与快照评估、同形解释树（纯函数）
   events.py     # 文档增量事件流：六表水位向量、(created_at, type_rank, id) 稳定合并、续页/续拉游标编解码
+  coordinates.py  # 批量偏移换算：全文一次扫描构建 codepoint/utf16/utf8_byte 边界映射，端点 O(1) 查表与整批校验（纯函数）
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
   db.py         # SQLite 连接、建表、读写事务
-  schemas.py    # 请求体模型（含门禁策略、归档结构与核验请求模型）
+  schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求与批量偏移换算模型）
 tests/
   test_matching.py  # 匹配算法单元测试
   test_diffing.py   # 编辑片段/投影/分类单元测试
@@ -1046,6 +1193,7 @@ tests/
   test_redacting.py # 批注驱动脱敏测试（范围合并/首尾相接/码点映射/整批可定位错误/字节稳定性/只读）
   test_coverage.py  # 批注覆盖图测试（候选合并/扫描线最大片段/definite优先/空区间/无缝铺满/顺延与确认/字节稳定性/只读）
   test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
+  test_coordinates.py # 批量偏移换算测试（emoji/组合字符/中文边界、代理对与多字节内部422、越界/start>end、200上限、只读与字节稳定）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
 Dockerfile
 docker-compose.yml

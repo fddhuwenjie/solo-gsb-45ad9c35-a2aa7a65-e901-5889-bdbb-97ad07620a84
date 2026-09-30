@@ -43,6 +43,11 @@
   合并重叠候选再计入 possible（同一 ID 不重复），unresolved、顺延占位与
   该版尚不存在的批注列入 exclusions；片段状态 covered / uncertain /
   uncovered 无缝铺满全文，接口只读、相同快照字节一致。
+- 批量偏移换算：为浏览器与外部工具把 codepoint / utf16 / utf8_byte
+  三种单位的半开区间批量互转（每请求至多 200 个）；先按目标版本全文
+  一次构建边界映射，整批 O(n + m)；越界、start > end、端点落入 UTF-16
+  代理对或 UTF-8 多字节字符内部时整批 422 并指出条目与端点，绝不取整；
+  接口只读，相同快照结果稳定。
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
+from . import coordinates as coords_mod
 from . import db
 from . import events as events_mod
 from . import gate as gate_mod
@@ -86,6 +92,7 @@ from .schemas import (
     ArchiveVerifyRequest,
     CompletionCreate,
     ConfirmationCreate,
+    CoordinateBatchCreate,
     DependencyBatchCreate,
     DocumentCreate,
     PolicyCreate,
@@ -102,7 +109,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -117,7 +124,10 @@ app = FastAPI(
         "以及文档增量事件流：六类只追加记录稳定合并，以水位向量 + "
         "续页 / 续拉游标分页，窗口内不漏、不重、不乱序；"
         "以及文档批注覆盖图：同一读事务读取版本全文与全部迁移位置，"
-        "把全文划分为 covered / uncertain / uncovered 最大片段并无缝铺满。"
+        "把全文划分为 covered / uncertain / uncovered 最大片段并无缝铺满；"
+        "以及批量偏移换算：同一读事务按目标版本全文一次构建 "
+        "codepoint / utf16 / utf8_byte 边界映射，整批 O(n+m) 互转半开区间，"
+        "代理对或多字节字符内部、越界、start>end 整批 422，绝不取整。"
     ),
     lifespan=lifespan,
 )
@@ -259,7 +269,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -475,6 +485,81 @@ def version_coverage(document_id: int, number: int, con=Depends(get_db)):
             }
             for e in exclusions
         ],
+    }
+
+
+@app.post(
+    "/documents/{document_id}/versions/{number}/coordinates", status_code=200
+)
+def convert_coordinates(
+    document_id: int,
+    number: int,
+    payload: CoordinateBatchCreate,
+    con=Depends(get_db),
+):
+    """批量偏移换算：codepoint / utf16 / utf8_byte 半开区间互转（只读）。
+
+    为浏览器（JavaScript 按 UTF-16 码元计偏移）与外部工具（按 UTF-8
+    字节计偏移）换算选区端点，避免 emoji 等字符让选区错位。版本全文在
+    **同一个 SQLite 读事务**（同一快照）中读出后，先对全文做一次线性
+    扫描构建三种单位的边界映射（:func:`coords_mod.build_coordinate_map`），
+    随后每个端点 O(1) 查表，整批复杂度 **O(n + m)**（n 为全文码点数，
+    m 为区间数，至多 200）。
+
+    请求声明 ``input_unit``（``codepoint`` / ``utf16`` / ``utf8_byte``）
+    并提交 1～200 个半开区间 ``[start, end)``；响应 ``results`` 逐项
+    （``index`` 为原请求下标）给出三种单位各自的对应范围。
+
+    以下情况**整批返回 422**（``detail.errors`` 一次性列出全部问题，
+    每条带 ``index`` 与 ``endpoint`` 条目端点定位，不做任何取整猜测）：
+
+    - 端点越界（``endpoint_out_of_range``，合法端点为 0..该单位总长）；
+    - ``start > end``（``start_after_end``，允许空区间 ``[x, x)``）；
+    - UTF-16 端点落在代理对两个码元之间
+      （``inside_surrogate_pair``）；
+    - UTF-8 端点落在多字节字符的字节中间
+      （``inside_multibyte_sequence``）。
+
+    组合字符是多个独立码点，码点边界即合法边界。接口不写入任何数据，
+    同一版本快照（版本内容只追加、不可变）下相同请求结果字节一致。
+    文档或版本不存在返回 404。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        version = _get_version(con, document_id, number)
+        text = version["content"]
+        cdata = coords_mod.build_coordinate_map(text)
+        outcome = coords_mod.convert_batch(
+            cdata,
+            payload.input_unit,
+            [(iv.start, iv.end) for iv in payload.intervals],
+        )
+
+    if outcome["errors"]:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "偏移换算请求校验失败，整批未换算（不对任何端点取整）",
+                "input_unit": payload.input_unit,
+                "lengths": {
+                    coords_mod.UNIT_CODEPOINT: cdata.codepoint_length,
+                    coords_mod.UNIT_UTF16: cdata.utf16_length,
+                    coords_mod.UNIT_UTF8_BYTE: cdata.utf8_length,
+                },
+                "errors": outcome["errors"],
+            },
+        )
+
+    return {
+        "document_id": document_id,
+        "version_number": number,
+        "input_unit": payload.input_unit,
+        "lengths": {
+            coords_mod.UNIT_CODEPOINT: cdata.codepoint_length,
+            coords_mod.UNIT_UTF16: cdata.utf16_length,
+            coords_mod.UNIT_UTF8_BYTE: cdata.utf8_length,
+        },
+        "results": outcome["results"],
     }
 
 

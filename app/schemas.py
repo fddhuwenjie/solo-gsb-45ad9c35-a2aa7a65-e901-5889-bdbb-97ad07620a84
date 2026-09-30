@@ -78,6 +78,34 @@ class RedactionCreate(BaseModel):
     )
 
 
+class CoordinateInterval(BaseModel):
+    """一个半开区间 ``[start, end)``（允许空区间 ``[x, x)``）。
+
+    偏移以请求级 ``input_unit`` 为准（codepoint / utf16 / utf8_byte）；
+    端点必须对齐码点边界，范围校验由 ``app.coordinates`` 整批完成，
+    故这里不做 ``ge=0`` 限制，以便把越界值作为带条目标定位的
+    422 业务错误返回（而非 schema 报错）。
+    """
+
+    start: int
+    end: int
+
+
+class CoordinateBatchCreate(BaseModel):
+    """批量偏移换算请求：声明输入单位并提交至多 200 个半开区间。"""
+
+    input_unit: Literal["codepoint", "utf16", "utf8_byte"] = Field(
+        description=(
+            "区间端点的计量单位：codepoint=Unicode 码点（本服务统一单位），"
+            "utf16=UTF-16 码元（JavaScript 字符串偏移），"
+            "utf8_byte=UTF-8 字节偏移"
+        )
+    )
+    intervals: List[CoordinateInterval] = Field(
+        min_length=1, max_length=200, description="待换算的半开区间（1～200 个）"
+    )
+
+
 class PolicyCreate(BaseModel):
     """提交文档发布门禁策略（按名称只追加修订）。
 
