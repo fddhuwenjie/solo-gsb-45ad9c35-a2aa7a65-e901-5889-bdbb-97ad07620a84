@@ -41,6 +41,15 @@
 末页返回 `resume_cursor` 用于续拉增量，**空轮也推进水位**；游标版本、结构、
 范围错误或跨文档使用一律 422，事件载荷只保留对应行落库时的稳定业务字段。
 
+此外提供**批量偏移单位换算**（`POST /documents/{id}/versions/{n}/coordinates`）：
+为浏览器（JavaScript 按 UTF-16 码元计偏移）与外部工具（常按 UTF-8 字节计偏移）
+把最多 200 个半开区间在 **Unicode 码点 / UTF-16 码元 / UTF-8 字节**之间一次性
+换算，响应逐项给出三种单位的对应范围并回显原索引；目标版本全文在**同一个
+SQLite 读事务**中读出，先按全文**一次构建边界映射**、再逐项 O(1) 换算，整体
+**O(n+m)**；越界、`start > end`、端点落在 UTF-16 代理对或 UTF-8 多字节字符
+内部时**整批 422** 并指出条目与端点，不四舍五入、不猜测；接口只读，
+同一快照结果字节稳定。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -63,7 +72,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（183 个用例）
+pytest                                       # 运行测试（229 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -437,6 +446,144 @@ ID 列表顺序必然相同。
 
 文档不存在返回 404。接口只读，不会创建或修改任何记录。
 
+### 批量偏移单位换算
+
+本服务所有接口的偏移都按 **Unicode 码点**计（Python 字符串索引即码点索引，
+emoji 等 BMP 外字符算 1 个码点）。但浏览器里 JavaScript 字符串按
+**UTF-16 码元**计（emoji 算 2 个码元），外部工具（编辑器、字节级 diff、
+语言工具链）又常按 **UTF-8 字节**计（中文 3 字节、emoji 4 字节）。
+直接把这些偏移提交给创建批注等接口会因 emoji、组合字符而错位。
+`POST /documents/{id}/versions/{n}/coordinates` 只读地把一批半开区间在三种
+单位之间换算，便于前端与外部工具先换算再调用本服务。
+
+请求体：
+
+| 字段 | 含义 |
+|---|---|
+| `unit` | 输入偏移单位：`codepoint` / `utf16` / `utf8_byte` |
+| `intervals` | 至多 **200** 个半开区间 `[start, end)`，字段 `start` / `end` 非负；`start == end` 的空区间合法 |
+
+响应逐项（`index` 为该区间在请求中的下标，顺序与请求一致）给出：
+
+- `codepoint` / `utf16` / `utf8_byte` 三个对象，各含 `start` / `end`；
+- 顶层 `source_length` 同时给出三种单位下的文本长度（末端边界）。
+
+实现要点：
+
+- 目标版本全文在**同一个 SQLite 读事务**（同一快照）中读出，先对全文**一次
+  扫描构建边界映射**，再对每个区间做 O(1) 端点换算，整体 **O(n + m)**
+  （n 为码点数、m 为区间数）；
+- 合法偏移只能落在**字符边界**上（`[0, 文本长度]` 的每个码点间隙）。
+
+**整批 422**——以下任一情况都拒绝**整批**（不返回任何换算结果、不取整猜测），
+`detail.errors` 一次性列出全部问题，每条带 `error` 机器码、`message` 中文说明、
+`path`（`intervals[i].start` / `intervals[i].end` / `intervals[i]`）、
+`index` 与 `endpoint`：
+
+| 情况 | 错误码 | `endpoint` |
+|---|---|---|
+| 端点越界（`> 文本长度`） | `offset_out_of_bounds` | `start` / `end` |
+| `start > end`（半开区间须 `start <= end`） | `start_after_end` | `range` |
+| 端点落在 UTF-16 代理对内部（高/低代理项之间） | `utf16_inside_surrogate_pair` | `start` / `end` |
+| 端点落在 UTF-8 多字节字符内部 | `utf8_inside_multibyte_char` | `start` / `end` |
+
+> 组合字符（如 `e` + 组合重音 `◌́`）是两个独立码点，组合符自身在 UTF-16 中
+> 是 1 个码元、在 UTF-8 中占 2 字节；落在其第 1 字节与第 2 字节之间同样属于
+> 「多字节字符内部」，会被整批拒绝。中文（BMP 内）在 UTF-16 中只占 1 个码元，
+> 但在 UTF-8 中占 3 字节。
+
+文档或版本不存在返回 404；`unit` 取值非法、区间超过 200 个、负数偏移等请求
+结构问题由 schema 直接返回 422。接口只读、不写入任何数据，同一快照与相同
+请求多次调用结果字节一致。
+
+含 emoji、组合字符与中文的示例：
+
+```bash
+B=http://localhost:8000
+
+# 新建文档：5 个码点 —— a、🎉、b、中、组合重音 ◌́(U+0301，附在「中」上)
+# Python: len("a🎉b中́") == 5；UTF-16 长度 6；UTF-8 长度 11
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "偏移换算示例",
+  "content": "a🎉b中́"
+}'
+
+# 1. 浏览器视角（UTF-16）：🎉 占代理对 [1, 3)，换算出码点 [1, 2) 与 UTF-8 [1, 5)
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "utf16",
+    "intervals": [{"start": 1, "end": 3}]
+  }'
+# → 200
+# {"document_id":1,"version_number":1,"unit":"utf16",
+#  "source_length":{"codepoint":5,"utf16":6,"utf8_byte":11},
+#  "interval_count":1,
+#  "intervals":[{"index":0,
+#    "codepoint":{"start":1,"end":2},
+#    "utf16":{"start":1,"end":3},
+#    "utf8_byte":{"start":1,"end":5}}]}
+
+# 2. 外部工具视角（UTF-8）：一次提交多个区间 —— 🎉[1,5)、中[6,9)、组合重音[9,11)
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "utf8_byte",
+    "intervals": [
+      {"start": 1, "end": 5},
+      {"start": 6, "end": 9},
+      {"start": 9, "end": 11}
+    ]
+  }'
+# → 200（index 原样回显，顺序与请求一致）
+# "intervals":[
+#   {"index":0,"codepoint":{"start":1,"end":2},"utf16":{"start":1,"end":3},"utf8_byte":{"start":1,"end":5}},
+#   {"index":1,"codepoint":{"start":3,"end":4},"utf16":{"start":4,"end":5},"utf8_byte":{"start":6,"end":9}},
+#   {"index":2,"codepoint":{"start":4,"end":5},"utf16":{"start":5,"end":6},"utf8_byte":{"start":10,"end":11}}]
+
+# 3. 码点视角（本服务原生单位）：选区「b中」码点 [2,4)，换算给浏览器 / 外部工具
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "codepoint",
+    "intervals": [{"start": 2, "end": 4}]
+  }'
+# → utf16 [4,6)（中文只占 1 码元）；utf8_byte [6,10)（中文占 3 字节）
+
+# 4. 落在 UTF-16 代理对内部（偏移 2 是 🎉 的高/低代理项之间）→ 整批 422
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "utf16",
+    "intervals": [{"start": 2, "end": 3}]
+  }'
+# → 422 {"detail":{"unit":"utf16","errors":[
+#     {"error":"utf16_inside_surrogate_pair","endpoint":"start","index":0,
+#      "path":"intervals[0].start",
+#      "message":"intervals[0].start=2 落在一个 UTF-16 代理对（高/低代理项之间），不是合法字符边界；偏移不得取整或猜测，请改用字符边界"}]}}
+
+# 5. 落在 UTF-8 多字节字符内部（偏移 7 在「中」[6,9) 内部）→ 整批 422
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "utf8_byte",
+    "intervals": [{"start": 7, "end": 9}]
+  }'
+# → 422 utf8_inside_multibyte_char，path=intervals[0].start
+
+# 6. 越界与 start>end 在同一批中一次性全部定位返回（整批不出任何结果）
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "codepoint",
+    "intervals": [{"start": 0, "end": 99}, {"start": 3, "end": 1}]
+  }'
+# → 422 errors（按下标、端点 start→end→range 稳定排序）：
+#   [{"error":"offset_out_of_bounds","endpoint":"end","index":0,...},
+#    {"error":"start_after_end","endpoint":"range","index":1,...}]
+
+# 7. 空区间 [end,end) 落在合法边界时允许（可用于表达光标 / 折叠选区）
+curl -X POST $B/documents/1/versions/1/coordinates \
+  -H 'Content-Type: application/json' -d '{
+    "unit": "utf16", "intervals": [{"start": 6, "end": 6}]
+  }'
+# → 200 codepoint {"start":5,"end":5}
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -451,6 +598,7 @@ ID 列表顺序必然相同。
 | POST | `/documents/{id}/versions` | 提交新版全文，触发全部批注的续接迁移 |
 | GET | `/documents/{id}/versions` | 版本列表 |
 | GET | `/documents/{id}/versions/{n}` | 某版全文及该版全部迁移结果 |
+| POST | `/documents/{id}/versions/{n}/coordinates` | 批量偏移单位换算：码点/UTF-16/UTF-8 半开区间一次构建映射逐项换算（至多 200 个，只读） |
 | GET | `/documents/{id}/versions/{n}/coverage` | 文档批注覆盖图：全文划分为 covered/uncertain/uncovered 最大片段，含 definite/possible 批注 ID 与 exclusions（只读） |
 | GET | `/documents/{id}/compare?from_version=&to_version=` | 任意两版间每条批注的范围、状态与匹配依据 |
 | GET | `/documents/{id}/impact?from_version=&to_version=` | 批注改动影响分析：码点级编辑片段 + 起始版每条批注范围到目标版的投影与分类 |
@@ -1029,6 +1177,7 @@ app/
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
+  coordinates.py # 批量偏移换算：码点/UTF-16/UTF-8 边界映射一次构建、逐项 O(1) 换算与整批可定位错误（纯函数）
   coverage.py   # 批注覆盖图：候选合并与扫描线切片为 covered/uncertain/uncovered 最大片段（纯函数）
   review.py     # 审阅依赖图算法：环检测、传递前置、拓扑分层（纯函数）
   gate.py       # 发布门禁策略树：语法校验（深度/节点数/枚举域）与快照评估、同形解释树（纯函数）
@@ -1044,6 +1193,7 @@ tests/
   test_review.py    # 审阅依赖编排测试（依赖校验/环检测/审阅计划/完成记录）
   test_gate.py      # 发布门禁测试（策略语法拒绝/修订只追加/同事务快照评估/不短路解释树/稳定性）
   test_redacting.py # 批注驱动脱敏测试（范围合并/首尾相接/码点映射/整批可定位错误/字节稳定性/只读）
+  test_coordinates.py # 批量偏移换算测试（emoji/组合字符/中文、代理对与多字节内部拒绝、越界/顺序/整批422/字节稳定/只读）
   test_coverage.py  # 批注覆盖图测试（候选合并/扫描线最大片段/definite优先/空区间/无缝铺满/顺延与确认/字节稳定性/只读）
   test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）

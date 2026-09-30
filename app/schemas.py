@@ -78,6 +78,33 @@ class RedactionCreate(BaseModel):
     )
 
 
+class CoordinateInterval(BaseModel):
+    """一个半开区间 ``[start, end)``，偏移单位由请求顶层 ``unit`` 声明。
+
+    ``start == end`` 的空区间合法；``start > end``、越界或端点落在
+    UTF-16 代理对 / UTF-8 多字节字符内部时整批 422（业务层校验）。
+    """
+
+    start: int = Field(ge=0, description="区间起点（含），按请求声明的单位计")
+    end: int = Field(ge=0, description="区间终点（不含），按请求声明的单位计")
+
+
+class CoordinateBatchCreate(BaseModel):
+    """批量偏移单位换算请求：声明输入单位，提交至多 200 个半开区间。
+
+    输入单位限 ``codepoint`` / ``utf16`` / ``utf8_byte``；响应逐项给出
+    三种单位的对应范围。任一区间非法（越界、``start > end``、落在字符内部）
+    则整批拒绝，不猜测、不取整。
+    """
+
+    unit: Literal["codepoint", "utf16", "utf8_byte"] = Field(
+        description="intervals 中 start / end 使用的偏移单位"
+    )
+    intervals: List[CoordinateInterval] = Field(
+        max_length=200, description="待换算的半开区间（至多 200 个，可为空列表）"
+    )
+
+
 class PolicyCreate(BaseModel):
     """提交文档发布门禁策略（按名称只追加修订）。
 

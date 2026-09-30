@@ -43,6 +43,11 @@
   合并重叠候选再计入 possible（同一 ID 不重复），unresolved、顺延占位与
   该版尚不存在的批注列入 exclusions；片段状态 covered / uncertain /
   uncovered 无缝铺满全文，接口只读、相同快照字节一致。
+- 批量偏移单位换算：为浏览器与外部工具在码点 / UTF-16 码元 / UTF-8 字节
+  之间批量换算半开区间；同一读事务读取目标版本全文，一次构建边界映射后
+  O(1) 逐项换算，整体 O(n+m)；越界、start>end、落在 UTF-16 代理对或
+  UTF-8 多字节字符内部时整批 422 并定位条目与端点，不取整、不猜测，
+  接口只读、同一快照结果稳定。
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
+from . import coordinates as coordinates_mod
 from . import db
 from . import events as events_mod
 from . import gate as gate_mod
@@ -86,6 +92,7 @@ from .schemas import (
     ArchiveVerifyRequest,
     CompletionCreate,
     ConfirmationCreate,
+    CoordinateBatchCreate,
     DependencyBatchCreate,
     DocumentCreate,
     PolicyCreate,
@@ -102,7 +109,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -118,6 +125,8 @@ app = FastAPI(
         "续页 / 续拉游标分页，窗口内不漏、不重、不乱序；"
         "以及文档批注覆盖图：同一读事务读取版本全文与全部迁移位置，"
         "把全文划分为 covered / uncertain / uncovered 最大片段并无缝铺满。"
+        "以及批量偏移单位换算：码点 / UTF-16 / UTF-8 半开区间一次构建映射、"
+        "O(n+m) 逐项换算，越界或落在代理对 / 多字节字符内部整批 422。"
     ),
     lifespan=lifespan,
 )
@@ -259,7 +268,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -476,6 +485,69 @@ def version_coverage(document_id: int, number: int, con=Depends(get_db)):
             for e in exclusions
         ],
     }
+
+
+@app.post("/documents/{document_id}/versions/{number}/coordinates")
+def convert_coordinates(
+    document_id: int,
+    number: int,
+    payload: CoordinateBatchCreate,
+    con=Depends(get_db),
+):
+    """批量偏移单位换算（只读，不写入任何数据）。
+
+    为浏览器与外部工具把选区偏移在 **Unicode 码点 / UTF-16 码元 / UTF-8 字节**
+    三种单位之间换算，避免 emoji 等 BMP 外字符让选区错位。请求声明 ``unit``
+    （``codepoint`` / ``utf16`` / ``utf8_byte``）并提交至多 200 个半开区间
+    ``[start, end)``；响应逐项（``index`` 为原请求下标）给出三种单位的对应范围。
+
+    目标版本全文在**同一个 SQLite 读事务**（同一快照）中读出，先按全文**一次
+    构建边界映射**，再对每个区间做 O(1) 换算，整体 **O(n + m)**（n 为码点数、
+    m 为区间数）。以下情况**整批返回 422**（``detail.errors`` 一次性列出全部
+    可定位错误，不四舍五入、不猜测）：
+
+    - 端点越界（``offset_out_of_bounds``，合法边界为 ``[0, 文本长度]``）；
+    - ``start > end``（``start_after_end``）；
+    - 端点落在 UTF-16 代理对内部（``utf16_inside_surrogate_pair``）或
+      UTF-8 多字节字符内部（``utf8_inside_multibyte_char``）。
+
+    ``start == end`` 的空区间合法。文档或版本不存在返回 404；接口只读，
+    同一快照（同一版本内容）与相同请求结果字节一致。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        version = _get_version(con, document_id, number)
+        text = version["content"]
+
+        bmap = coordinates_mod.build_boundary_map(text)
+        intervals = [(iv.start, iv.end) for iv in payload.intervals]
+        results, errors = coordinates_mod.convert_intervals(
+            bmap, payload.unit, intervals
+        )
+
+        if errors:
+            raise HTTPException(
+                422,
+                detail={
+                    "message": "偏移换算校验失败，整批未处理（未做任何取整猜测）",
+                    "unit": payload.unit,
+                    "errors": [e.to_dict() for e in errors],
+                },
+            )
+
+        response = {
+            "document_id": document_id,
+            "version_number": number,
+            "unit": payload.unit,
+            "source_length": {
+                "codepoint": bmap.codepoint_count,
+                "utf16": bmap.utf16_length,
+                "utf8_byte": bmap.utf8_length,
+            },
+            "interval_count": len(results),
+            "intervals": results,
+        }
+    return response
 
 
 @app.post("/documents/{document_id}/versions", status_code=201)
